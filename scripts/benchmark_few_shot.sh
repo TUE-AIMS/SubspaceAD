@@ -9,20 +9,25 @@
 #SBATCH --output=logs/out_%j.txt # standard output
 #SBATCH --error=logs/err_%j.txt  # standard error
 
+
+mkdir -p logs
+
 eval "$($CONDA_EXE shell.bash hook)"
+conda activate subspacead
+
 # Set the absolute path to your MVTec AD dataset directory
-MVTEC_PATH="datasets/mvtec-ad"
+MVTEC_PATH="../datasets/mvtec-ad"
 
 # Set the absolute path to your VisA dataset directory
 # (e.g., /path/to/your/datasets/VisA_pytorch/1cls)
-VISA_PATH="datasets/VisA_pytorch/1cls"
+VISA_PATH="../datasets/VisA_pytorch/1cls"
 
 
 echo "--- Starting k-shot experiments for MVTec AD ---"
 for k in 1 2 4
 do
     echo "--- Running MVTec AD k=$k ---"
-    conda run -n subspacead python -u main.py \
+    python -u main.py \
         --dataset_name mvtec_ad \
         --dataset_path "$MVTEC_PATH" \
         --image_res 672 \
@@ -31,6 +36,7 @@ do
         --model_ckpt "facebook/dinov2-with-registers-giant" \
         --aug_count 30 \
         --pca_ev 0.99 \
+        --seed 42 \
         --agg_method "mean" \
         --outdir "few_shot_results/results_k${k}_mvtec_dinov2G" 
 done
@@ -40,7 +46,7 @@ echo "--- Starting k-shot experiments for VisA ---"
 for k in 1 2 4
 do
     echo "--- Running VisA k=$k ---"
-    conda run -n subspacead python -u main.py \
+    python -u main.py \
         --dataset_name visa \
         --dataset_path "$VISA_PATH" \
         --image_res 672 \
@@ -50,6 +56,7 @@ do
         --aug_count 30 \
         --pca_ev 0.99 \
         --agg_method "mean" \
+        --seed 42 \
         --outdir "few_shot_results/results_k${k}_visa_dinov2G" 
 done
 

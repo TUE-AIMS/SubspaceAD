@@ -28,6 +28,9 @@ def get_args():
     log_group = parser.add_argument_group("Logistics")
 
     data_group.add_argument(
+        "--seed", type=int, default=42, help="Random seed for reproducibility."
+    )
+    data_group.add_argument(
         "--dataset_name",
         type=str,
         required=True,

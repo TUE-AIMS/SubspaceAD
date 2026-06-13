@@ -169,13 +169,13 @@ python main.py \
 | ---------- | -------------- | -------- | -------- |
 | **1-Shot** | PromptAD       | 94.2     | 86.9     |
 |            | AnomalyDINO    | 96.6     | 87.4     |
-|            | **SubspaceAD** | **97.1** | **93.4** |
+|            | **SubspaceAD** | **97.1** | **93.2** |
 | **2-Shot** | PromptAD       | 95.7     | 88.3     |
 |            | AnomalyDINO    | 96.9     | 89.7     |
-|            | **SubspaceAD** | **97.6** | **93.7** |
+|            | **SubspaceAD** | **97.5** | **93.8** |
 | **4-Shot** | PromptAD       | 96.6     | 89.1     |
 |            | AnomalyDINO    | 97.7     | 92.6     |
-|            | **SubspaceAD** | **97.9** | **94.7** |
+|            | **SubspaceAD** | **98.0** | **94.7** |
 
 ### Batched Zero-Shot
 

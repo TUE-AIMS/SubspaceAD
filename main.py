@@ -9,6 +9,7 @@ import random
 import pandas as pd
 import torch
 import torchvision.transforms.functional as TF
+from scipy.ndimage import label as cc_label, generate_binary_structure
 from PIL import Image
 from tqdm import tqdm
 import cv2
@@ -19,7 +20,6 @@ from sklearn.metrics import (
     average_precision_score,
 )
 from sklearn.decomposition import PCA
-from anomalib.metrics.aupro import _AUPRO as TM_AUPRO
 
 from src.subspacead.config import get_args, parse_layer_indices, parse_grouped_layers
 from src.subspacead.utils.common import (
@@ -30,7 +30,10 @@ from src.subspacead.utils.common import (
 from src.subspacead.data.datasets import get_dataset_handler
 from src.subspacead.core.extractor import FeatureExtractor
 from src.subspacead.core.pca import PCAModel, KernelPCAModel
-from src.subspacead.post_process.scoring import calculate_anomaly_scores, post_process_map
+from src.subspacead.post_process.scoring import (
+    calculate_anomaly_scores,
+    post_process_map,
+)
 from src.subspacead.utils.viz import save_visualization, save_overlay_for_intro
 from src.subspacead.post_process.specular import (
     specular_mask_torch,
@@ -39,9 +42,6 @@ from src.subspacead.post_process.specular import (
 from src.subspacead.core.patching import process_image_patched, get_patch_coords
 from src.subspacead.data.transforms import get_augmentation_transform
 
-torch.manual_seed(42)
-np.random.seed(42)
-random.seed(42)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 print(f"Using device: {DEVICE}")
@@ -96,9 +96,114 @@ def topk_mean(arr, frac=0.01):
     return float(np.mean(flat[idx]))
 
 
+def compute_aupro(
+    anomaly_maps,
+    gt_masks,
+    fpr_limit: float = 0.3,
+    num_thresholds: int = 300,
+    connectivity: int = 8,
+):
+    """
+    MVTec-AD AUPRO (Bergmann et al.).
+
+    Args:
+        anomaly_maps: list/array of [H, W] float prediction maps. Higher = more anomalous.
+        gt_masks:     list/array of [H, W] binary masks (uint8/bool). 1 = anomaly.
+        fpr_limit:    integration upper bound on Set FPR. MVTec convention: 0.3.
+        num_thresholds: number of FPR-linspaced thresholds inside [0, fpr_limit].
+        connectivity: 4 or 8 for connected components.
+
+    Returns:
+        AUPRO in [0, 1] (perfect detector = 1.0). NaN if undefined.
+    """
+    preds = np.stack([np.asarray(p, dtype=np.float32) for p in anomaly_maps])
+    gts = np.stack([np.asarray(g, dtype=np.uint8) for g in gt_masks])
+    assert preds.shape == gts.shape, f"shape mismatch: {preds.shape} vs {gts.shape}"
+
+    if not np.isfinite(preds).all():
+        return float("nan")
+
+    # 1. Connected components -> per-region (img_idx, sorted_scores_inside_region).
+    structure = generate_binary_structure(2, 2 if connectivity == 8 else 1)
+    region_sorted_scores = []  # list of 1D arrays, one per region
+    for i in range(gts.shape[0]):
+        if gts[i].sum() == 0:
+            continue
+        labeled, n = cc_label(gts[i], structure=structure)
+        for r in range(1, n + 1):
+            region_mask = labeled == r
+            region_scores = preds[i][region_mask]
+            region_sorted_scores.append(np.sort(region_scores))  # ascending
+
+    if len(region_sorted_scores) == 0:
+        return float("nan")
+
+    neg_scores = preds[gts == 0]
+    if neg_scores.size == 0:
+        return float("nan")
+    neg_sorted = np.sort(neg_scores)  # ascending
+    n_neg = neg_sorted.size
+
+    # 3. Pick thresholds that are linear in FPR over [0, fpr_limit].
+    target_fprs = np.linspace(0.0, fpr_limit, num_thresholds + 1)[1:]  # exclude 0
+    # quantile(1 - f): use sorted neg array directly for stability
+    q_idx = np.clip(
+        np.floor((1.0 - target_fprs) * (n_neg - 1)).astype(np.int64), 0, n_neg - 1
+    )
+    thresholds = neg_sorted[q_idx]  # shape: [num_thresholds]
+
+    # 4. For each threshold, compute realized FPR and mean PRO.
+    fp_counts = n_neg - np.searchsorted(neg_sorted, thresholds, side="left")
+    fprs = fp_counts.astype(np.float64) / n_neg
+
+    # Mean PRO across regions, vectorized via searchsorted on each region's sorted scores.
+    pros_accum = np.zeros(num_thresholds, dtype=np.float64)
+    for region_scores in region_sorted_scores:
+        rs = region_scores
+        area = rs.size
+        # for each t: overlap = (rs >= t).sum() / area
+        ge_counts = rs.size - np.searchsorted(rs, thresholds, side="left")
+        pros_accum += ge_counts / area
+    pros = pros_accum / len(region_sorted_scores)
+
+    # 5. Sort by FPR (should already be ascending up to ties), prepend (0, 0) anchor.
+    order = np.argsort(fprs, kind="stable")
+    fprs_s = np.concatenate([[0.0], fprs[order]])
+    pros_s = np.concatenate([[0.0], pros[order]])
+
+    # 6. Clip strictly to [0, fpr_limit] with linear interpolation at the boundary.
+    if fprs_s[-1] > fpr_limit:
+        cut = np.searchsorted(fprs_s, fpr_limit, side="right")
+        # linear interp between fprs_s[cut-1] and fprs_s[cut] at x=fpr_limit
+        f0, f1 = fprs_s[cut - 1], fprs_s[cut]
+        p0, p1 = pros_s[cut - 1], pros_s[cut]
+        p_at = p0 + (p1 - p0) * (fpr_limit - f0) / (f1 - f0) if f1 > f0 else p0
+        fprs_s = np.concatenate([fprs_s[:cut], [fpr_limit]])
+        pros_s = np.concatenate([pros_s[:cut], [p_at]])
+    elif fprs_s[-1] < fpr_limit:
+        # didn't reach fpr_limit (rare): extrapolate flat from last point
+        fprs_s = np.concatenate([fprs_s, [fpr_limit]])
+        pros_s = np.concatenate([pros_s, [pros_s[-1]]])
+
+    aupro = np.trapz(pros_s, fprs_s) / fpr_limit
+    return float(aupro)
+
+
 def main():
     args = get_args()
     run_name = f"{args.dataset_name}_{args.agg_method}_layers{''.join(args.layers.split(','))}_res{args.image_res}_docrop{int(args.docrop)}"
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+        np.random.seed(args.seed)
+        random.seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(args.seed)
+            torch.cuda.manual_seed_all(args.seed)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+    else:
+        print("No seed specified; aborting for reproducibility.")
+        return
     if args.patch_size:
         run_name += f"_patch{args.patch_size}"
     if args.use_kernel_pca:
@@ -127,6 +232,8 @@ def main():
             # Create a short string for augs, e.g., "hrc"
             aug_str = "".join(sorted([a[0] for a in args.aug_list]))
             run_name += f"_aug{args.aug_count}x{aug_str}"
+
+    run_name += f"_seed{args.seed}"
 
     args.outdir = os.path.join(args.outdir, run_name)
     os.makedirs(args.outdir, exist_ok=True)
@@ -169,10 +276,13 @@ def main():
     for category in categories:
         logging.info(f"--- Processing Category: {category} ---")
 
+        if args.k_shot is not None and args.aug_count > 0 and args.aug_list:
+            aug_transform = get_augmentation_transform(args.aug_list, args.image_res)
+
+        else:
+            aug_transform = None
         if category in args.no_aug_categories:
-            logging.warning(
-                f"Disabling augmentation for {category} category"
-            )
+            logging.warning(f"Disabling augmentation for {category} category")
             aug_transform = None
         handler = get_dataset_handler(args.dataset_name, args.dataset_path, category)
         train_paths = handler.get_train_paths()
@@ -494,7 +604,7 @@ def main():
                 path_batch = val_paths[i : i + args.batch_size]
                 pil_imgs = [Image.open(p).convert("RGB") for p in path_batch]
                 is_anomaly_batch = [
-                    "good" not in p and "Normal" not in p for p in path_batch
+                    "good" not in str(p) and "Normal" not in str(p) for p in path_batch
                 ]
 
                 if args.patch_size:
@@ -802,7 +912,8 @@ def main():
                             torch.zeros_like(torch.from_numpy(_scores)).to(DEVICE),
                         )
 
-                torch.cuda.synchronize(DEVICE)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize(DEVICE)
                 logging.info("Warm-up complete.")
             except Exception as e:
                 logging.warning(
@@ -816,8 +927,8 @@ def main():
         px_true_all = []
         px_pred_all_auroc = []
         px_pred_all_normalized = []
-        anomalous_gt_masks = []
-        anomalous_anomaly_maps = []
+        pro_gt_masks = []
+        pro_anomaly_maps = []
         vis_saved_count = 0
         all_inference_times = []
 
@@ -829,7 +940,8 @@ def main():
             is_anomaly_batch = [
                 "good" not in str(p) and "Normal" not in str(p) for p in path_batch
             ]
-            torch.cuda.synchronize(DEVICE)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(DEVICE)
             start_time = time.perf_counter()
 
             final_anomaly_maps_for_batch = []
@@ -1005,7 +1117,8 @@ def main():
                     final_anomaly_maps_for_batch.append(anomaly_map_final)
 
             # End timing
-            torch.cuda.synchronize(DEVICE)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(DEVICE)
             end_time = time.perf_counter()
             all_inference_times.append(end_time - start_time)
 
@@ -1059,10 +1172,10 @@ def main():
                     anomaly_map_normalized.flatten().astype(np.float32)
                 )
 
-                if is_anomaly:
-                    anomalous_gt_masks.append(gt_mask)
-                    anomalous_anomaly_maps.append(anomaly_map_normalized)
+                pro_gt_masks.append(gt_mask)
+                pro_anomaly_maps.append(anomaly_map_final.astype(np.float32))
 
+                if is_anomaly:
                     if args.save_intro_overlays:
                         vis_img = pil_img
                         save_overlay_for_intro(
@@ -1202,38 +1315,35 @@ def main():
             )
         else:
             px_f1 = np.nan
-        if len(anomalous_gt_masks) > 0:
-            preds_np = np.stack(anomalous_anomaly_maps).astype(np.float32)  # [N,H,W]
-            gts_np = np.stack(anomalous_gt_masks).astype(np.uint8)  # [N,H_W]
-            preds_t = (
-                torch.from_numpy(preds_np).unsqueeze(1).to(torch.float32).to(DEVICE)
-            )  # [N,1,H,W]
-            gts_t = (
-                torch.from_numpy(gts_np).unsqueeze(1).to(torch.bool).to(DEVICE)
-            )  # [N,1,H,W]
-
+        if len(pro_gt_masks) > 0 and any(mask.any() for mask in pro_gt_masks):
             fpr_cap = getattr(args, "pro_integration_limit", 0.3)
-            tm_metric = TM_AUPRO(fpr_limit=fpr_cap).to(DEVICE)
-            au_pro = tm_metric(preds_t, gts_t).item()
+            au_pro = compute_aupro(
+                pro_anomaly_maps,
+                pro_gt_masks,
+                fpr_limit=fpr_cap,
+                num_thresholds=300,
+                connectivity=8,
+            )
         else:
             logging.warning(
-                f"No anomalous images found in test set for {category}. AUPRO is not computable."
+                f"No anomalous ground-truth regions found in test set for {category}. "
+                "AUPRO is not computable."
             )
             au_pro = np.nan
-
-        # 5. Log and store results
         logging.info(
             f"{category} Results | I-AUROC: {img_auroc:.4f} | I-AUPR: {img_aupr:.4f} | "
             f"P-AUROC: {px_auroc:.4f} | AU-PRO: {au_pro:.4f} | "
             f"I-F1: {img_f1:.4f} | P-F1: {px_f1:.4f}"
         )
         all_results.append(
-            [category, img_auroc, img_aupr, px_auroc, au_pro, img_f1, px_f1]
+            [category, args.seed, img_auroc, img_aupr, px_auroc, au_pro, img_f1, px_f1]
         )
+
     df = pd.DataFrame(
         all_results,
         columns=[
             "Category",
+            "Seed",
             "Image AUROC",
             "Image AUPR",
             "Pixel AUROC",
